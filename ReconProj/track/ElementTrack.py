@@ -2,35 +2,121 @@ import os
 import json
 import cv2
 import uuid
+import imageio
 import numpy as np
 from tqdm import tqdm
+from loguru import logger
+from shapely.geometry import Polygon
 from donkeydonkey.structure import Message
 from ReconProj.model import Mask2FormerCA,YoloCorner
 
 __all__ = ["TrafficSignTrack"]
 
 
-# 表示单个点的坐标信息
-class CorPt:
+# 要素的类别信息
+class CorElem:
     def __init__(self):
-        self.frame_timestamp = None
-        self.type_index = None
+        self.id = None
+        self.frameid = None
         self.type = None
         self.coordinate = []
-        self.ldmk_id = None
+        self.element_id =None
+        self.color = None
 
     def to_dict(self):
         info={
-            "frame_timestamp":self.frame_timestamp,
-            "type_index":self.type_index,
+            "id":self.id,
             "type":self.type,
             "coordinate": self.coordinate,
-            "ldmk_id":self.ldmk_id
+            "element_id":self.element_id
         }
         return info
-    
+
+
+
+class ElementTracker(object):
+    def __init__(self,element: CorElem):
+        self.element = element
+        self.lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.03))
         
+
+        self.tracked_frame_id = [] # 保存跟踪过的frame id
+        self.tracked_coor_list = [] # 保存跟踪过的坐标
+        self.element_observation = []
+
+        self.tracked_frame_id.append(self.element.frameid)
+        self.last_corner_frame_id = self.element.frameid
+        self.tracked_coor_list.append(self.element.coordinate)
+        self.element_observation.append((self.element.frameid,self.element.id))
         
+        self.color = np.random.randint(0, 255, size=3).tolist()        
+        self.overlap_ratio = 0.8
+        self.max_overlap_num = 3
+        self.track_finished =  False
+
+
+    def track_element(self,next_img_idx,next_elements_list,ImagesContainer):
+        # 返回状态: -1:表示退出追踪，0表示没有追踪上，1表示追踪上
+        # 跟踪前先做判断
+        if self.tracked_frame_id[-1] - self.last_corner_frame_id > self.max_overlap_num:
+            return -1, self.element_observation
+        
+        # 对追踪的每张图像做判断
+        coor_cur_pts =  np.array(self.tracked_coor_list[-1],dtype=np.float32).reshape(-1, 1, 2)
+        pre_img = ImagesContainer[self.tracked_frame_id[-1]]
+        next_img = ImagesContainer[next_img_idx]
+        next_opticalflow_pts, opticalflow_status, err = cv2.calcOpticalFlowPyrLK(pre_img,next_img,coor_cur_pts,None,**self.lk_params)
+        next_opticalflow_pts = np.round(next_opticalflow_pts.reshape(-1,2)).astype(int).tolist()
+
+        overlap_element = self.element_overlap(next_opticalflow_pts,next_elements_list)
+        self.tracked_frame_id.append(next_img_idx)
+        
+        if overlap_element is None:
+            # 没有追踪上，则保存光流结果
+            self.tracked_coor_list.append(next_opticalflow_pts)
+            return 0, None
+        else:
+            # 追踪上，则使用角点结果
+            self.tracked_coor_list.append(overlap_element.coordinate)
+            self.last_corner_frame_id=next_img_idx
+            self.element_observation.append((next_img_idx,overlap_element.id))
+            return 1, overlap_element.id
+
+
+
+    def element_overlap(self,coor_list1,elements_list):
+        """目标物体重叠度"""
+        if elements_list is None:
+            return None    
+           
+        polygon1 = Polygon([
+            (coor_list1[0][0], coor_list1[0][1]),
+            (coor_list1[1][0], coor_list1[1][1]), 
+            (coor_list1[2][0], coor_list1[2][1]), 
+            (coor_list1[3][0], coor_list1[3][1])
+            ]
+        )
+        for element in elements_list:
+            coor_list2 = element.coordinate
+            polygon2 = Polygon([
+                (coor_list2[0][0], coor_list2[0][1]),
+                (coor_list2[1][0], coor_list2[1][1]), 
+                (coor_list2[2][0], coor_list2[2][1]), 
+                (coor_list2[3][0], coor_list2[3][1])
+                ]
+            )
+            overlap_area = polygon1.intersection(polygon2).area
+            overlap_ratio = overlap_area / polygon2.area
+            if overlap_ratio >self.overlap_ratio:
+                return element
+            else:
+                return None
+        
+        return None
+
+
+
+
 
 
 class TrafficSignTrack(object):
@@ -52,27 +138,25 @@ class TrafficSignTrack(object):
         f.close
         self.target_cam = ["cam_front"]
         self.tar_img_wh = [960, 540]
+        self.overlap_ratio =0.7
         self.tar_element = []
         self.img_dir = img_dir
         self.cache_img_dir = cache_img_dir
         self.cache_mask_dir = cache_mask_dir
         self.cache_corner_dir = cache_corner_dir
-        self.mask_model = Mask2FormerCA(mask_modelweight_path)
-        self.yolo_model = YoloCorner(yolo_modelweight_path)
+        self.mask_model_path = mask_modelweight_path
+        self.yolo_model_path = yolo_modelweight_path
         self.tar_element_type = [1]
-        self.ldmk_observations =[] #每张图像的
-
 
     def __call__(self):
-        
-        # self.ResizeAndMask()
-        # self.GenerateCorner()
-        self.OpticalFlow_Features()
-
-        print("")
-        
+        # 基于重叠度
+        # self.ExtracteFramesCorner()
+        self.FramesOpticalFlow()
+        print("done")
 
     def ResizeAndMask(self):
+        """Resize images to the target size."""
+        mask_model = Mask2FormerCA(self.mask_model_path)
         for label in tqdm(self.labels,desc="Mask: "):
             timestamp = label.meta.timestamp
             for cam in self.target_cam:
@@ -82,194 +166,183 @@ class TrafficSignTrack(object):
                 images_outpath = os.path.join(self.cache_img_dir,f"{timestamp}.jpeg")
                 cv2.imwrite(images_outpath,img)
 
-                ori_mask_img = self.mask_model(img)
+                ori_mask_img = mask_model(img)
                 mask_outpath = os.path.join(self.cache_mask_dir, f"{timestamp}.png")
                 cv2.imwrite(mask_outpath,ori_mask_img)
+    
 
-    def GenerateCorner(self):
-        img_keypts_dict = dict()
-        for label in tqdm(self.labels,desc="CorExtrac: "):
+    def ExtracteFramesCorner(self,):
+        """Extracte corner points at each frames by YOLO."""
+
+        YoloModel = YoloCorner(self.yolo_model_path)
+        img_elements_dict = dict()
+
+        # 逐帧提取
+        for frame_index, label in enumerate(tqdm(self.labels)):
             timestamp = label.meta.timestamp
-            img_keypts_list= img_keypts_dict.setdefault(timestamp,list())
+            elements_dict= img_elements_dict.setdefault(timestamp,dict())
+
             img_path = os.path.join(self.cache_img_dir,f"{timestamp}.jpeg")
             img = cv2.imread(img_path)
-            bboxes_keypoints = self.yolo_model(img)
-            
+            bboxes_keypoints = YoloModel(img)
             for index, type in enumerate(bboxes_keypoints[1].tolist()):
                 if type not in self.tar_element_type:
                     continue
                 key_point_list = bboxes_keypoints[0].tolist()[index]
-                for key_point in key_point_list:
-                    newpt = CorPt()
-                    newpt.frame_timestamp = timestamp
-                    newpt.coordinate = key_point
-                    newpt.type = type
-                    newpt.type_index = index
-                    img_keypts_list.append(newpt)
+                # 排除角点的不完整识别
+                if key_point_list[2]==[0,0] and  key_point_list[3]==[0,0]:
+                    continue
+                # 排除太小的识别结果
+                if self.is_element_filter(key_point_list):
+                    continue
+                id = uuid.uuid1().hex
+                elements_dict[id] = {
+                    "id":id,
+                    "type":type,
+                    "frameid":frame_index,
+                    "element_id": None,
+                    "color": np.random.randint(0, 255, size=3).tolist(),
+                    "coordinate": key_point_list
+                }
 
-        ''' For Debug, visualize the points on each frame,
-            and save corner extraction result
-        '''         
-        for timestamp, img_keypts_list in tqdm(img_keypts_dict.items(),desc="saving images with corners:"):
+        # 清理空的要素集合
+        img_elements_dict = {k: v for k, v in img_elements_dict.items() if v != {}}
+        output_path ="/data/elementtrack/frame_elements.json"
+        with open(output_path,"w") as f:
+            json.dump(img_elements_dict,f)
+        f.close()
+    
+
+    def FramesOpticalFlow(self,):
+        """Track all element by overlap ratio."""
+
+        file = "/data/elementtrack/frame_elements.json"
+        with open(file,"r") as f:
+            frame_elements = json.load(f)
+        f.close()
+
+        frames_keypts_dict = dict()
+        for timestamp, element_list in frame_elements.items():
+            ele_object_list =[]
+            for element_id, element_info in element_list.items():
+                ele_object = self.trans_element_object(element_info)
+                ele_object_list.append(ele_object)
+            frames_keypts_dict[int(timestamp)]= ele_object_list
+
+
+        # Only load images once
+        ImagesContainer_raw = dict() 
+        ImagesContainer = dict()
+        for frame_index, label in enumerate(tqdm(self.labels,desc="Loading images: ")):
+            timestamp = label.meta.timestamp
             img_path = os.path.join(self.cache_img_dir,f"{timestamp}.jpeg")
-            img = cv2.imread(img_path)
-
-            for point in img_keypts_list:
-                coor = point.coordinate
-                cv2.circle(img, coor, 5, color=(0, 255, 255))
-            corner_path = os.path.join(self.cache_corner_dir,f"{timestamp}.jpeg")
-            cv2.imwrite(corner_path,img)
-        
-        # save corner extraction result
-        timestamp_keypoints = dict()
-        for timestamp, img_keypts_list in img_keypts_dict.items():
-            kpts_info = []
-            for point in img_keypts_list:
-                kpts_info.append(point.to_dict())
-            timestamp_keypoints[int(timestamp)] = kpts_info
-
-        output_path ="/data/elementtrack/img_box_keypts.json"
-        with open(output_path,"w") as f:
-            json.dump(timestamp_keypoints,f)
-        f.close()
+            ImagesContainer[frame_index] = cv2.imread(img_path,cv2.IMREAD_GRAYSCALE)
+            ImagesContainer_raw[frame_index] = cv2.imread(img_path)
 
 
 
-    def OpticalFlow_Features(self,):
-        '''光流估计进行匹配'''
-        lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.03))
-        file = "/data/elementtrack/img_box_keypts.json"
-        with open(file,"r") as f:
-            data = json.load(f)
-        frames_keypts_dict = dict()
-        for timestamp, pt_list in data.items():
-            pt_object_list =[]
-            for pt_info in pt_list:
-                pt_object = self._trans_point_object(pt_info)
-                pt_object_list.append(pt_object)
-            frames_keypts_dict[int(timestamp)]= pt_object_list
+        # Start tracking
+        already_tracked_element = []
+        tracker_container  = []
+        elemen_container = []
 
-        allpoints_observations = list()
-        for index in range(len(self.labels)):
-            # 获取当前帧的关键点
-            cur_timestamp = self.labels[index].meta.timestamp
-            next_timestamp = self.labels[index+1].meta.timestamp
-            
-            for point in frames_keypts_dict[cur_timestamp]:
-                ldmk_id = uuid.uuid1().hex
-                point.ldmk_id = ldmk_id
-                allpoints_observations.append(point)
-            
-            # 获取下一帧的光流结果
-            cur_img_path = os.path.join(self.cache_img_dir,f"{cur_timestamp}.jpeg")
-            next_img_path = os.path.join(self.cache_img_dir,f"{next_timestamp}.jpeg")
-            cur_img = cv2.imread(cur_img_path,cv2.IMREAD_GRAYSCALE)
-            next_img = cv2.imread(next_img_path,cv2.IMREAD_GRAYSCALE)
-            coor_cur_pts = np.array([pt.coordinate for pt in frames_keypts_dict[cur_timestamp]],dtype=np.float32).reshape(-1, 1, 2)
-            
-            next_opticalflow_pts, opticalflow_status, err = cv2.calcOpticalFlowPyrLK(cur_img,next_img,coor_cur_pts,None,**lk_params)
-            next_opticalflow_pts = np.round(next_opticalflow_pts.reshape(-1,2)).astype(int).tolist()
-            # 角点跟踪状态判断
-            next_corner_points_list = frames_keypts_dict[next_timestamp]
-            for index, statu in enumerate(opticalflow_status.tolist()):
-                if statu == 0:  # 没有追踪上
+        # 逐帧遍历
+        start = False
+        for index in range(len(self.labels)-1):
+            cur_img_timestamp = self.labels[index].meta.timestamp
+            next_img_timestamp = self.labels[index+1].meta.timestamp
+
+            if cur_img_timestamp == 1709880865191:
+                print("")
+
+            elements_list = frames_keypts_dict.get(cur_img_timestamp,None)
+            if  elements_list is None and start is False:
+                continue
+            start=True
+
+            # 要素是否要生成跟踪器？被追踪上的就不生成，只对没有追踪上ele生成追踪器
+            if elements_list != None:
+                for element in elements_list:
+                    ele_id = element.id
+                    if ele_id not in already_tracked_element:
+                        already_tracked_element.append(ele_id)
+                        trackobject = ElementTracker(element)
+                        tracker_container.append(trackobject)
+                    else:
+                        continue
+
+            # 跟踪器内的容器进行跟踪，跟踪器输入是当前帧和后一帧
+            next_elements_list = frames_keypts_dict.get(next_img_timestamp,None)
+            for tracker in tracker_container:
+                statue, info = tracker.track_element(index+1,next_elements_list,ImagesContainer)
+                if statue == 1:
+                    already_tracked_element.append(info)
+                elif statue == 0:
                     continue
-                else: # 追踪上
-                    next_pt_coor = next_opticalflow_pts[index]
-                    next_pt_surround= self._get_surround_pixels(self.tar_img_wh,next_pt_coor,4)
-                    for corner_pt in next_corner_points_list:
-                        if corner_pt.coordinate in next_pt_surround:# 范围内
-                            newpt = CorPt()
-                            newpt.frame_timestamp = next_timestamp
-                            newpt.coordinate = next_pt_coor
-                            newpt.type = corner_pt.type
-                            newpt.type_index = corner_pt.type_index
-                            newpt.ldmk_id = corner_pt.ldmk_id
-                            allpoints_observations.append(newpt)
-                        else: # 范围外，视为新的点
-                            newpt = CorPt()
-                            newpt.frame_timestamp = next_timestamp
-                            newpt.coordinate = next_pt_coor
-                            newpt.type = frames_keypts_dict[cur_timestamp][index].type
-                            newpt.type_index = frames_keypts_dict[cur_timestamp][index].type_index
-                            newpt.ldmk_id =  frames_keypts_dict[cur_timestamp][index].ldmk_id
-                            frames_keypts_dict[next_timestamp].append(newpt)
-                            allpoints_observations.append(newpt)
-
-        # 统计每个ldmk的观测值
-        ldmk_observ = dict()
-        for pt in allpoints_observations:
-            ldmk_id = pt.ldmk_id
-            observation_list = ldmk_observ.setdefault(ldmk_id,list())
-            observation_list.append(pt.to_dict())
+                elif statue == -1:
+                    elemen_container.append(info)
+                    tracker_container.remove(tracker)
         
-        output_path ="/data/elementtrack/ldmks_observations.json"
-        with open(output_path,"w") as f:
-            json.dump(ldmk_observ,f)
-        f.close()
+        print("Track element finished")
+        # For debug        
+        self.visualize_track_result(elemen_container,frame_elements,ImagesContainer_raw)
+
+        return elemen_container
+
+    # ###################################################################################
+    # #################################基本功能函数#######################################
+    # ###################################################################################
 
 
+    def trans_element_object(self,element_info):
+        newele = CorElem()
+        newele.id = element_info["id"]
+        newele.frameid = element_info["frameid"]
+        newele.coordinate = element_info["coordinate"]
+        newele.type  = element_info["type"]
+        newele.element_id= element_info["element_id"]
+        newele.color =  element_info["color"]
+        return newele
 
-    
+    def is_element_filter(self,coor_list:list):
+        """目标物体过滤"""
+        polygon = Polygon([
+            (coor_list[0][0], coor_list[0][1]),
+            (coor_list[1][0], coor_list[1][1]), 
+            (coor_list[2][0], coor_list[2][1]), 
+            (coor_list[3][0], coor_list[3][1])
+            ]
+        )
+        if polygon.area<40*50:
+            return True
+        else:
+            return False
 
 
-
-
-
-
-    def Trianglation(self,):
-        """三角化"""
-        print("")
-
-
-
-    # ###############################################################################
-    # #################################功能函数#######################################
-    # ###############################################################################
-
-    def _get_surround_pixels(self, image_wh,point_coor, radius:int = 1):
-        [center_x, center_y] = point_coor
-        [width,height] = image_wh
-        surround_coors = []
+    def visualize_track_result(self,elemen_container,frame_elements,ImagesContainer_raw):
+        for ele_list in elemen_container:
+            if len(ele_list)<2:
+                continue
+            color = np.random.randint(0, 255, size=3).tolist()
+            for img_ele in ele_list:
+                (img_idx,ele_id) = img_ele
+                timestamp = self.labels[img_idx].meta.timestamp
+                elel_obj_coor = frame_elements[str(timestamp)][ele_id]["coordinate"]
+                
+                image = ImagesContainer_raw[img_idx]
+                pts = np.array(elel_obj_coor, np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                cv2.fillPoly(mask, [pts], 255)
+                image[mask == 255] = np.array(color)  # 设置为目标颜色
+                ImagesContainer_raw[img_idx] = image
         
-        x_min = max(center_x - radius, 0)
-        x_max = min(center_x + radius, width - 1)
-        y_min = max(center_y - radius, 0)
-        y_max = min(center_y + radius, height - 1)
-
-        for x in range(x_min, x_max + 1):
-            for y in range(y_min, y_max + 1):
-                if x ==center_x and y == center_y:
-                    continue
-                surround_coors.append([x, y])
-        return surround_coors
-    
-    def _trans_point_object(self,point_info):
-        # 变量转换成对象
-        newpt = CorPt()
-        newpt.frame_timestamp = int(point_info["frame_timestamp"])
-        newpt.coordinate = point_info["coordinate"]
-        newpt.type = point_info["type"]
-        newpt.type_index = point_info["type_index"]
-        newpt.ldmk_id = point_info["ldmk_id"]
-        return newpt
-    
-    def _optical_flow_corner_visual(self,):
-        """绘制光流跟踪的结果"""
-        lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.03))
-        file = "/data/elementtrack/img_box_keypts.json"
-        with open(file,"r") as f:
-            data = json.load(f)
-        frames_keypts_dict = dict()
-        for timestamp, pt_list in data.items():
-            pt_object_list =[]
-            for pt_info in pt_list:
-                pt_object = self._trans_point_object(pt_info)
-                pt_object_list.append(pt_object)
-            frames_keypts_dict[int(timestamp)]= pt_object_list
-
+        video_name = '/data/track_result.mp4'
+        fps = 30
+        with imageio.get_writer(video_name, fps=fps) as video:
+            for index, label in enumerate(self.labels):
+                timestamp =label.meta.timestamp
+                img =ImagesContainer_raw[index]
+                video.append_data(img)
         
-
-
-        
-        print("")
+        logger.info(f"save track video done.")
